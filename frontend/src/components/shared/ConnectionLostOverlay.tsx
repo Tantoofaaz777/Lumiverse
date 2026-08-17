@@ -24,25 +24,45 @@ export default function ConnectionLostOverlay() {
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | null = null
 
+    const beginResumeGrace = () => {
+      if (overlayWasShowingAtHideRef.current) {
+        return
+      }
+      setInResumeGrace(true)
+      if (timer) clearTimeout(timer)
+      timer = setTimeout(() => setInResumeGrace(false), RESUME_GRACE_MS)
+      overlayWasShowingAtHideRef.current = false
+    }
+
     const onVisChange = () => {
       if (document.visibilityState === 'hidden') {
         const state = useStore.getState()
         const healthyNow = state.wsConnected && state.wsAuthSynced && state.wsRoundTripVerified
         overlayWasShowingAtHideRef.current =
           state.isAuthenticated && state.wsHasEverConnected && !healthyNow
-      } else if (document.visibilityState === 'visible') {
         if (!overlayWasShowingAtHideRef.current) {
-          setInResumeGrace(true)
+          // Enter grace before Android freezes the page. A stale heartbeat can
+          // otherwise mark the socket down before React processes `resume`.
           if (timer) clearTimeout(timer)
-          timer = setTimeout(() => setInResumeGrace(false), RESUME_GRACE_MS)
+          timer = null
+          setInResumeGrace(true)
         }
-        overlayWasShowingAtHideRef.current = false
+      } else if (document.visibilityState === 'visible') {
+        beginResumeGrace()
       }
     }
 
+    const onResume = () => {
+      if (document.visibilityState === 'visible') beginResumeGrace()
+    }
+
     document.addEventListener('visibilitychange', onVisChange)
+    document.addEventListener('resume', onResume)
+    window.addEventListener('pageshow', onResume)
     return () => {
       document.removeEventListener('visibilitychange', onVisChange)
+      document.removeEventListener('resume', onResume)
+      window.removeEventListener('pageshow', onResume)
       if (timer) clearTimeout(timer)
     }
   }, [])

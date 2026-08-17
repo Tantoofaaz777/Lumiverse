@@ -33,6 +33,8 @@ const windowMock = {
 class MockWebSocket {
   static readonly CONNECTING = 0
   static readonly OPEN = 1
+  static readonly CLOSING = 2
+  static readonly CLOSED = 3
   static instances: MockWebSocket[] = []
 
   readyState = MockWebSocket.OPEN
@@ -128,6 +130,29 @@ describe('WebSocketClient resume watchdog guard', () => {
     expect(pingTimeouts).toEqual([3_000])
   })
 
+  test('treats a visible Android PWA without input focus as resumed', () => {
+    const client = makeClient()
+    const socket = client.ws as MockWebSocket
+    const originalHasFocus = documentMock.hasFocus
+    const pingTimeouts: number[] = []
+
+    try {
+      documentMock.hasFocus = () => false
+      client.sendPingNow = (timeoutMs: number) => {
+        pingTimeouts.push(timeoutMs)
+      }
+      client.wasVisible = false
+
+      client.sendVisibility()
+
+      expect(pingTimeouts).toEqual([3_000])
+      expect(socket.sent).toContain(JSON.stringify({ type: 'visibility', visible: false }))
+    } finally {
+      documentMock.hasFocus = originalHasFocus
+      client.disconnect()
+    }
+  })
+
   test('suppresses the next fast watchdog ping once when a system modal is expected', () => {
     const client = makeClient()
     const pingTimeouts: number[] = []
@@ -182,6 +207,66 @@ describe('WebSocketClient resume watchdog guard', () => {
     worker.emit({ type: 'timeout', generation: firstStart.generation })
     expect(socket.closeCalls).toBe(0)
     expect(client.ws).toBe(socket)
+    client.disconnect()
+  })
+
+  test('invalidates a pending heartbeat watchdog when the page freezes', () => {
+    const client = makeClient()
+    const socket = client.ws as MockWebSocket
+    client.startPing()
+    const worker = MockWorker.instances.at(-1)!
+    const start = worker.sent.find((message) => message.type === 'start')
+
+    worker.emit({ type: 'ping', generation: start.generation, timeoutMs: 10_000 })
+    client.pauseHeartbeatForLifecycle()
+    worker.emit({ type: 'timeout', generation: start.generation })
+
+    expect(socket.closeCalls).toBe(0)
+    expect(client.ws).toBe(socket)
+    client.disconnect()
+  })
+
+  test('pauses heartbeat while hidden and starts a fresh watchdog on visible resume', () => {
+    const client = makeClient()
+    const originalVisibility = documentMock.visibilityState
+    const originalHasFocus = documentMock.hasFocus
+
+    try {
+      client.startPing()
+      const worker = MockWorker.instances.at(-1)!
+      const firstStart = worker.sent.find((message) => message.type === 'start')
+
+      documentMock.visibilityState = 'hidden'
+      client.handleLifecycleStateChange()
+      expect(client.heartbeatPausedForLifecycle).toBe(true)
+
+      documentMock.visibilityState = 'visible'
+      documentMock.hasFocus = () => false
+      client.handleLifecycleStateChange()
+
+      const starts = worker.sent.filter((message) => message.type === 'start')
+      expect(client.heartbeatPausedForLifecycle).toBe(false)
+      expect(starts.at(-1).generation).not.toBe(firstStart.generation)
+      expect(worker.sent.at(-1)).toMatchObject({ type: 'ping-now', timeoutMs: 3_000 })
+    } finally {
+      documentMock.visibilityState = originalVisibility
+      documentMock.hasFocus = originalHasFocus
+      client.disconnect()
+    }
+  })
+
+  test('reconnects immediately when a suspended socket is already closed on resume', () => {
+    const client = makeClient()
+    const staleSocket = client.ws as MockWebSocket
+    staleSocket.readyState = MockWebSocket.CLOSED
+    client.wasVisible = false
+    client.reconnectTimer = setTimeout(() => {}, 30_000)
+
+    client.resumeFromLifecycle()
+
+    expect(client.ws).not.toBe(staleSocket)
+    expect(client.reconnectTimer).toBeNull()
+    expect(client.wasVisible).toBe(true)
     client.disconnect()
   })
 })

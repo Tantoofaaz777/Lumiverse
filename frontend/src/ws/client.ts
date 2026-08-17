@@ -51,6 +51,8 @@ export class WebSocketClient {
   private heartbeatGeneration = 0
   private fallbackPingTimer: ReturnType<typeof setInterval> | null = null
   private fallbackPongWatchdog: ReturnType<typeof setTimeout> | null = null
+  /** True while the page lifecycle has paused heartbeat work for suspension. */
+  private heartbeatPausedForLifecycle = false
   private url: string
   private shouldReconnect = true
   private spindleInfoLoggingEnabled = true
@@ -130,6 +132,7 @@ export class WebSocketClient {
       console.log('[WS] Closed:', e.code, e.reason)
       if (this.ws !== thisSocket) return
       this.stopPing()
+      this.ws = null
       this.emit(WS_CLOSE, { code: e.code, reason: e.reason })
       if (this.shouldReconnect) {
         this.scheduleReconnect()
@@ -191,6 +194,7 @@ export class WebSocketClient {
 
   private startPing() {
     this.stopPing()
+    this.heartbeatPausedForLifecycle = false
     const generation = ++this.heartbeatGeneration
     if (this.ensureHeartbeatWorker()) {
       this.heartbeatWorker!.postMessage({
@@ -215,6 +219,7 @@ export class WebSocketClient {
   }
 
   private sendPingNow(timeoutMs: number = PONG_TIMEOUT_MS) {
+    if (this.heartbeatPausedForLifecycle) return
     if (this.ensureHeartbeatWorker()) {
       this.heartbeatWorker!.postMessage({
         type: 'ping-now',
@@ -357,12 +362,14 @@ export class WebSocketClient {
   private startVisibilityTracking() {
     this.stopVisibilityTracking()
 
-    // Seed wasVisible with the current state so the first sendVisibility()
-    // doesn't fire a spurious resume-check ping. onopen → forcePing already
-    // verifies round-trip for the initial connection.
+    // Seed wasVisible with page visibility rather than input focus. Android
+    // standalone PWAs can resume visibly while document.hasFocus() is still
+    // false, which is a valid passive lifecycle state rather than background.
+    // This also keeps the first sendVisibility() from firing a spurious resume
+    // ping; onopen → forcePing already verifies the initial connection.
     this.wasVisible = this.isDocumentVisible()
 
-    const handler = () => this.sendVisibility()
+    const handler = () => this.handleLifecycleStateChange()
     this.visibilityHandler = handler
 
     const addListener = (
@@ -378,11 +385,17 @@ export class WebSocketClient {
     // lifecycle event that commonly fires during backgrounding/suspension.
     this.sendVisibility()
     addListener(document, 'visibilitychange', handler)
+    addListener(document, 'freeze', () => this.pauseHeartbeatForLifecycle())
+    addListener(document, 'resume', () => this.resumeFromLifecycle())
     addListener(window, 'focus', handler)
     addListener(window, 'blur', handler)
     addListener(window, 'pageshow', handler)
     addListener(window, 'pagehide', () => this.sendVisibility(true))
     addListener(window, 'beforeunload', () => this.sendVisibility(true))
+
+    // A connection can finish opening after the page has already gone hidden.
+    // Do not leave a watchdog armed across a later lifecycle freeze.
+    if (!this.isDocumentVisible()) this.pauseHeartbeatForLifecycle()
   }
 
   private stopVisibilityTracking() {
@@ -397,7 +410,10 @@ export class WebSocketClient {
       this.wasVisible = visible
       return
     }
-    this.send({ type: 'visibility', visible })
+    // Presence/stream focus still require actual input focus. Only lifecycle
+    // recovery uses page visibility, because visible-without-focus is normal
+    // immediately after an Android PWA resume.
+    this.send({ type: 'visibility', visible: !forceHidden && this.isDocumentFocused() })
     this.sendStreamFocus(forceHidden)
     // Hidden→visible transition: iOS aggressively kills WS in suspended PWAs.
     // Send a fast-watchdog ping so we detect a dead socket within ~3s, instead
@@ -408,6 +424,62 @@ export class WebSocketClient {
       }
     }
     this.wasVisible = visible
+  }
+
+  private handleLifecycleStateChange() {
+    if (this.isDocumentVisible()) {
+      this.resumeFromLifecycle()
+      return
+    }
+    this.sendVisibility()
+    // `hidden` is the last lifecycle transition mobile browsers reliably
+    // deliver. Pause here as well as on `freeze` so no watchdog can expire
+    // while Android is in the process of suspending the PWA.
+    this.pauseHeartbeatForLifecycle()
+  }
+
+  private pauseHeartbeatForLifecycle() {
+    if (this.heartbeatPausedForLifecycle) return
+    this.heartbeatPausedForLifecycle = true
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    // Incrementing the heartbeat generation makes a watchdog that expired
+    // while Android was freezing the page harmless when its message is later
+    // delivered on resume.
+    this.stopPing()
+  }
+
+  private resumeFromLifecycle() {
+    if (!this.isDocumentVisible()) return
+
+    if (this.recoverConnectionOnResume()) {
+      this.wasVisible = true
+      return
+    }
+
+    if (this.heartbeatPausedForLifecycle && this.ws?.readyState === WebSocket.OPEN) {
+      this.startPing()
+    }
+    this.sendVisibility()
+  }
+
+  private recoverConnectionOnResume() {
+    const socket = this.ws
+    if (!socket) {
+      if (this.shouldReconnect) this.reconnectNow()
+      return true
+    }
+    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+      return false
+    }
+
+    this.stopPing()
+    this.ws = null
+    this.emit(WS_CLOSE, { code: 1006, reason: 'stale socket detected' })
+    if (this.shouldReconnect) this.reconnectNow()
+    return true
   }
 
   private consumeResumePingSuppression() {
@@ -438,16 +510,31 @@ export class WebSocketClient {
   }
 
   private sendStreamFocus(forceHidden = false) {
-    const chatId = !forceHidden && this.isDocumentVisible() ? this.focusedChatId : null
+    const chatId = !forceHidden && this.isDocumentFocused() ? this.focusedChatId : null
     this.send({ type: 'stream_focus', chatId })
   }
 
   private isDocumentVisible() {
-    return document.visibilityState === 'visible' && document.hasFocus()
+    return document.visibilityState === 'visible'
+  }
+
+  private isDocumentFocused() {
+    return this.isDocumentVisible() && document.hasFocus()
+  }
+
+  private reconnectNow() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    this.connect()
   }
 
   private scheduleReconnect() {
     if (this.reconnectTimer) return
+    // Timers and sockets are unreliable while a page is backgrounded. The
+    // resume handler reconnects immediately when the page becomes visible.
+    if (!this.isDocumentVisible()) return
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
       this.connect()
